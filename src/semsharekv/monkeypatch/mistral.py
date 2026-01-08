@@ -12,7 +12,7 @@ Note: Mistral uses sliding-window attention; DynamicCache can stop growing past 
 import torch
 import torch.nn.functional as F
 
-from .semshare_context import get_semshare_context
+from ..semshare_context import get_semshare_context
 
 
 def _token_importance_from_attn(attn_weights: torch.Tensor, window: int = 32) -> torch.Tensor:

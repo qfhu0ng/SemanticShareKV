@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: semsharekv
+Version: 0.1.0
+Summary: SemanticShareKV: semantic KV sharing + pruning demo
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch
+Requires-Dist: transformers
+Requires-Dist: faiss-cpu
+
+# SemanticShareKV
+# SemanticShareKV

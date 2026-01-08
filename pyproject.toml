@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semsharekv"
+version = "0.1.0"
+description = "SemanticShareKV: semantic KV sharing + pruning demo"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "transformers",
+  "faiss-cpu",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
