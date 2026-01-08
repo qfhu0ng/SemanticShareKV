@@ -4,6 +4,8 @@ A lightweight **semantic KV-cache reuse + pruning** prototype for HuggingFace `t
 
 This repo explores **reusing KV cache across semantically similar prompts** (instead of strict prefix match), to reduce prefill compute and optionally prune KV to save memory.
 
+This repository is an independent re-implementation of the method described in [arXiv:2509.24832].
+It is not an official code release and is not affiliated with the paper’s authors.
 ---
 
 ## What this repo does
