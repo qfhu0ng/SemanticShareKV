@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+pip-cache/
+pip-tmp/
+hf-cache/
+modelscope-cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
