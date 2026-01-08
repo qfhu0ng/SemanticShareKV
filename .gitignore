@@ -1,18 +1,12 @@
 __pycache__/
 *.pyc
 *.pyo
-*.log
-.ipynb_checkpoints/
-
-# local caches / big artifacts
+*.egg-info/
+dist/
+build/
+.hf-cache/
 hf-cache/
 modelscope-cache/
 pip-cache/
 pip-tmp/
-
-# model weights (do NOT commit)
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.ckpt
+*.log
