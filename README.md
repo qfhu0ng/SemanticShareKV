@@ -6,6 +6,7 @@ This repo explores **reusing KV cache across semantically similar prompts** (ins
 
 This repository is an independent re-implementation of the method described in [arXiv:2509.24832].
 It is not an official code release and is not affiliated with the paper’s authors.
+
 ---
 
 ## What this repo does
