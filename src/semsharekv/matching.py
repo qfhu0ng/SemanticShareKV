@@ -1,76 +1,66 @@
-import numpy as np
 import torch
-from .rope import build_rope_cache, apply_rope_to_embeddings
-from .lsh import FaissLSHIndex
+import torch.nn.functional as F
 
-def l2_normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return x / (x.norm(dim=-1, keepdim=True) + eps)
+# 你现在的代码里如果用到了 LSH（FaissLSHIndex），这里可以保留 import
+# 没用到也不影响
+try:
+    from .lsh import FaissLSHIndex  # optional
+except Exception:
+    FaissLSHIndex = None
+
 
 @torch.no_grad()
-def prepare_fuzzy_mapping(
-    ref_e: torch.Tensor,
-    tgt_e: torch.Tensor,
-    use_rope: bool = True,
-    lsh_bits: int = 256,
-    lsh_k: int = 8,
-) -> dict:
+def prepare_fuzzy_mapping(ref_e: torch.Tensor, tgt_e: torch.Tensor, use_rope: bool = True, topk: int = 64):
     """
-    ref_e: [Lr, D]
-    tgt_e: [Lt, D]
     Return:
       {
-        "map": LongTensor [Lt],
-        "sim": FloatTensor [Lt]  (cosine sim of chosen match)
+        "map": LongTensor [Lt]    # for each target position, which ref position to reuse
       }
+
+    关键：所有候选索引/取向量的步骤在 CPU 上做，避免 GPU 上的非法索引触发 device-side assert。
     """
-    device = tgt_e.device
-    Lt, D = tgt_e.shape
-    Lr = ref_e.shape[0]
-    if ref_e.shape[1] != D:
-        raise ValueError("ref/tgt embedding dim mismatch")
+    # [Lr, D], [Lt, D]
+    assert ref_e.dim() == 2 and tgt_e.dim() == 2
+    Lr, D = ref_e.shape
+    Lt, D2 = tgt_e.shape
+    assert D == D2
 
-    if use_rope:
-        cos, sin = build_rope_cache(max(Lr, Lt), D, device=device, dtype=tgt_e.dtype)
-        ref_e2 = apply_rope_to_embeddings(ref_e, cos, sin)
-        tgt_e2 = apply_rope_to_embeddings(tgt_e, cos, sin)
-    else:
-        ref_e2, tgt_e2 = ref_e, tgt_e
+    # ---- move to CPU for safe indexing ----
+    ref = ref_e.detach().float().cpu().contiguous()
+    tgt = tgt_e.detach().float().cpu().contiguous()
 
-    ref_n = l2_normalize(ref_e2).float().cpu().numpy().astype(np.float32)
-    tgt_n = l2_normalize(tgt_e2).float().cpu().numpy().astype(np.float32)
+    # normalize for cosine similarity
+    ref_n = F.normalize(ref, dim=-1)
+    tgt_n = F.normalize(tgt, dim=-1)
 
-    index = FaissLSHIndex(dim=D, nbits=lsh_bits)
-    index.build(ref_n)
-    _, I = index.search(tgt_n, k=min(lsh_k, Lr))  # [Lt, k]
+    # brute-force topk cosine (Lt x Lr) might be heavy if L is huge; but in your demo L is not crazy.
+    # if you have a real LSH index, you can swap this block with LSH candidate retrieval.
+    sims = tgt_n @ ref_n.t()  # [Lt, Lr]
+    k = min(topk, Lr)
+    topv, topi = torch.topk(sims, k=k, dim=-1)  # [Lt,k]
 
-    ref_t = torch.from_numpy(ref_n).to(device=device)
-    tgt_t = torch.from_numpy(tgt_n).to(device=device)
-    I_t = torch.from_numpy(I).to(device=device)
+    # pick best ref index for each tgt token
+    best = topi[:, 0].to(torch.long)  # [Lt]
 
-    best = []
-    sims = []
-    for i in range(Lt):
-        cand = I_t[i]
-        cand_vec = ref_t[cand]
-        s = (cand_vec @ tgt_t[i])  # [k]
-        j = torch.argmax(s)
-        best_idx = cand[j]
-        best.append(best_idx)
-        sims.append(s[j])
+    # ---- safety clamp (double insurance) ----
+    best = torch.clamp(best, 0, Lr - 1)
 
-    return {"map": torch.stack(best).long(), "sim": torch.stack(sims).float()}
+    # return mapping on ORIGINAL device (so rearrange_past_kv can use it)
+    return {"map": best.to(device=ref_e.device)}
 
-def rearrange_past_kv(past_key_values, mapping: torch.Tensor):
+
+@torch.no_grad()
+def rearrange_past_kv(ref_pkv, mapping: torch.Tensor):
     """
-    past_key_values: tuple(layers) of (k, v)
-      k/v: [bs, n_kv_heads, Lr, head_dim]
-    mapping: [Lt] target token -> reference token index
-    returns: tuple(layers) of (k2, v2) where seq_len = Lt
+    ref_pkv: tuple[(k,v)] per layer, each: [bs, kvh, Lr, d]
+    mapping: [Lt] long, each entry in [0, Lr-1]
+    Return injected pkv aligned to Lt: [bs, kvh, Lt, d]
     """
-    new = []
-    idx = mapping.view(1, 1, -1, 1)
-    for (k, v) in past_key_values:
-        k2 = k.gather(dim=2, index=idx.expand(k.size(0), k.size(1), -1, k.size(3))).contiguous()
-        v2 = v.gather(dim=2, index=idx.expand(v.size(0), v.size(1), -1, v.size(3))).contiguous()
-        new.append((k2, v2))
-    return tuple(new)
+    mapping = mapping.to(dtype=torch.long, device=ref_pkv[0][0].device)
+    out = []
+    for (k, v) in ref_pkv:
+        # index along seq dimension (dim=2)
+        k2 = k.index_select(2, mapping)
+        v2 = v.index_select(2, mapping)
+        out.append((k2, v2))
+    return tuple(out)

@@ -2,6 +2,8 @@
 import os
 import argparse
 import asyncio
+import time
+import hashlib
 from typing import Optional, Dict, Any
 
 import torch
@@ -99,11 +101,18 @@ def semshare_prefill(model, tok, target_prompt: str, ref_item: CacheItem):
 
 
 @torch.no_grad()
-def build_prunable_cache(model, past_kv_tuple, layer_scores: dict, keep_ratio=0.6, min_keep=256,
-                         attn_recovery=0.55, cold_keep_ratio=0.2):
+def build_prunable_cache(
+    model,
+    past_kv_tuple,
+    layer_scores: dict,
+    keep_ratio=0.6,
+    min_keep=256,
+    attn_recovery=0.55,
+    cold_keep_ratio=0.2,
+):
     cache = PrunableDynamicCache(
         config=model.config,
-        prune_policy=PrunePolicy(keep_ratio=keep_ratio, min_keep=min_keep)
+        prune_policy=PrunePolicy(keep_ratio=keep_ratio, min_keep=min_keep),
     )
 
     # skip None layers defensively
@@ -112,6 +121,8 @@ def build_prunable_cache(model, past_kv_tuple, layer_scores: dict, keep_ratio=0.
         if kv is None:
             continue
         k, v = kv
+        if k is None or v is None:
+            continue
         legacy.append((k.detach(), v.detach()))
     cache.seed_from_legacy_tuple(tuple(legacy))
 
@@ -122,7 +133,7 @@ def build_prunable_cache(model, past_kv_tuple, layer_scores: dict, keep_ratio=0.
             score,
             attn_recovery=attn_recovery,
             cold_keep_ratio=cold_keep_ratio,
-            min_keep=min_keep
+            min_keep=min_keep,
         )
         cache.set_keep_indices(layer_idx, keep_idx)
 
@@ -166,14 +177,20 @@ def create_app(model, tok, store: LRUCacheStore):
     @app.post("/v1/generate")
     async def generate(req: GenerateReq) -> Dict[str, Any]:
         async with gpu_lock:
+            # ---- timing start (wall + perf) ----
+            start_ms = int(time.time() * 1000)
+            t0 = time.perf_counter()
+
             inputs = tok(req.prompt, return_tensors="pt").to(model.device)
             tgt_e = get_e_cache(model, inputs["input_ids"])
 
             sim = None
             used_semshare = False
+            cache_hit = False
+            ref_key = None
 
             if req.use_semshare and len(list(store.items())) > 0:
-                _, ref_item, sim = retrieve_best_reference(store, tgt_e, model.device)
+                ref_key, ref_item, sim = retrieve_best_reference(store, tgt_e, model.device)
                 if (ref_item is not None) and (sim is not None) and (sim >= req.sim_threshold):
                     past_kv_tuple, layer_scores = semshare_prefill(model, tok, req.prompt, ref_item)
                     prunable_cache = build_prunable_cache(model, past_kv_tuple, layer_scores)
@@ -186,6 +203,7 @@ def create_app(model, tok, store: LRUCacheStore):
                         top_p=req.top_p,
                     )
                     used_semshare = True
+                    cache_hit = True
                 else:
                     out = model.generate(
                         **inputs,
@@ -207,10 +225,25 @@ def create_app(model, tok, store: LRUCacheStore):
 
             # store this prompt’s prefill cache for future reuse (online store, no persistence)
             item = prefill_and_make_item(model, tok, req.prompt)
-            key = req.store_key or f"p{hash(req.prompt) & 0xffffffff:x}"
+            key = req.store_key or ("p" + hashlib.md5(req.prompt.encode("utf-8")).hexdigest()[:8])
             store.put(key, item)
 
-            return {"text": text, "used_semshare": used_semshare, "retrieved_sim": float(sim) if sim is not None else None, "store_key": key}
+            # ---- timing end ----
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            run_key = f"{'H' if cache_hit else 'M'}_{latency_ms:.0f}ms_{start_ms}_{key}"
+
+            return {
+                "text": text,
+                "used_semshare": used_semshare,
+                "cache_hit": cache_hit,
+                "ref_key": ref_key,
+                "retrieved_sim": float(sim) if sim is not None else None,
+                "store_key": key,
+                # new fields:
+                "start_ms": start_ms,
+                "latency_ms": latency_ms,
+                "run_key": run_key,
+            }
 
     return app
 

@@ -2,8 +2,9 @@
 import os
 import argparse
 import asyncio
+import time
 import hashlib
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 import torch
 from fastapi import FastAPI
@@ -19,6 +20,7 @@ from semsharekv import (
     patch_llama_attention, patch_mistral_attention,
 )
 from semsharekv.store import pooled_cosine_01
+from semsharekv.lsh import lsh_token_match_and_sim
 
 
 def is_mistral_like(name: str) -> bool:
@@ -28,9 +30,8 @@ def is_mistral_like(name: str) -> bool:
 
 @torch.no_grad()
 def get_e_cache(model, input_ids: torch.Tensor) -> torch.Tensor:
-    # Minimal E-cache: token embeddings [L, D]
-    emb = model.get_input_embeddings()(input_ids)  # [1, L, D]
-    return emb.squeeze(0)  # [L, D]
+    emb = model.get_input_embeddings()(input_ids)  # [1,L,D]
+    return emb.squeeze(0)  # [L,D]
 
 
 @torch.no_grad()
@@ -54,14 +55,25 @@ def prefill_and_make_item(model, tok, prompt: str) -> CacheItem:
 
 
 @torch.no_grad()
-def retrieve_best_reference(
-    store: LRUCacheStore, tgt_e: torch.Tensor, device: torch.device
-) -> Tuple[Optional[str], Optional[CacheItem], float]:
+def retrieve_best_reference(store: LRUCacheStore, tgt_e: torch.Tensor, device: torch.device):
+    """
+    Choose best reference by LSH-distance similarity (paper-style), not pooled cosine.
+
+    sim := 1 - mean_hamming/nbits, where each target token is matched to nearest ref token in Hamming space.
+    """
+    import numpy as np
+
     best_key, best_item, best_sim = None, None, -1.0
+
+    # tgt_e: [Lt, D] torch -> np
+    tgt_np = tgt_e.detach().to("cpu").float().numpy()
+
     for k, item in store.items():
-        sim = pooled_cosine_01(tgt_e, item.e_cache.to(device))
+        ref_np = item.e_cache.detach().to("cpu").float().numpy()  # [Lr, D]
+        _, sim = lsh_token_match_and_sim(ref_np, tgt_np, nbits=256, seed=1234)
         if sim > best_sim:
             best_sim, best_key, best_item = sim, k, item
+
     return best_key, best_item, best_sim
 
 
@@ -79,9 +91,9 @@ def semshare_prefill(model, tok, target_prompt: str, ref_item: CacheItem):
 
     ctx = SemShareContext(
         enabled=True,
-        injected_past_kv=inj_pkv,     # injected KV for each layer
-        layer_recompute_idx={},       # let monkeypatch fill
-        score_store={},               # will be filled by monkeypatch
+        injected_past_kv=inj_pkv,
+        layer_recompute_idx={},
+        score_store={},
         attn_recovery=0.55,
         recompute_hot_ratio=0.5,
         recompute_cold_ratio=0.1,
@@ -91,7 +103,7 @@ def semshare_prefill(model, tok, target_prompt: str, ref_item: CacheItem):
 
     out = model(**inputs, use_cache=True, output_attentions=False, return_dict=True)
 
-    disable_semshare()  # IMPORTANT: decode uses HF cache normally
+    disable_semshare()
 
     pkv = out.past_key_values
     if hasattr(pkv, "key_cache") and hasattr(pkv, "value_cache"):
@@ -117,22 +129,16 @@ def build_prunable_cache(
         prune_policy=PrunePolicy(keep_ratio=keep_ratio, min_keep=min_keep),
     )
 
-    # Convert legacy tuple; skip None layers defensively
+    # skip None layers defensively
     legacy = []
     for kv in past_kv_tuple:
         if kv is None:
-            legacy.append(None)
             continue
         k, v = kv
         if k is None or v is None:
-            legacy.append(None)
             continue
         legacy.append((k.detach(), v.detach()))
-
-    # seed_from_legacy_tuple expects a tuple of (k,v) for each layer;
-    # if you used None placeholders, filter them out and rely on set_keep_indices for valid layers.
-    compact = tuple([x for x in legacy if x is not None])
-    cache.seed_from_legacy_tuple(compact)
+    cache.seed_from_legacy_tuple(tuple(legacy))
 
     for layer_idx, score in layer_scores.items():
         if score is None:
@@ -165,19 +171,17 @@ def parse_args():
     p.add_argument("--model_dir", type=str, required=True)
     p.add_argument("--max_items", type=int, default=64)
     p.add_argument("--hf_home", type=str, default=os.environ.get("HF_HOME", "/root/autodl-tmp/hf-cache"))
-    # default offline (no HF network). use --online to allow network.
-    p.add_argument("--online", action="store_true", help="Allow HF Hub network access (default: offline)")
+    p.add_argument("--offline", action="store_true", default=True)
     return p.parse_args()
 
 
 def create_app(model, tok, store: LRUCacheStore):
     app = FastAPI()
-    gpu_lock = asyncio.Lock()  # serialize GPU calls for stability
+    gpu_lock = asyncio.Lock()
 
     @app.get("/v1/cache/stats")
     async def cache_stats() -> Dict[str, Any]:
-        keys = [k for k, _ in store.items()]
-        return {"items": len(keys), "keys": keys}
+        return {"items": len(list(store.items())), "keys": [k for k, _ in store.items()]}
 
     @app.post("/v1/cache/clear")
     async def cache_clear() -> Dict[str, Any]:
@@ -187,45 +191,33 @@ def create_app(model, tok, store: LRUCacheStore):
     @app.post("/v1/generate")
     async def generate(req: GenerateReq) -> Dict[str, Any]:
         async with gpu_lock:
+            # ---- timing start (wall + perf) ----
+            start_ms = int(time.time() * 1000)
+            t0 = time.perf_counter()
+
             inputs = tok(req.prompt, return_tensors="pt").to(model.device)
             tgt_e = get_e_cache(model, inputs["input_ids"])
 
-            sim: Optional[float] = None
+            sim = None
             used_semshare = False
             cache_hit = False
-            ref_key: Optional[str] = None
+            ref_key = None
 
-            # ---- generation ----
-            if req.use_semshare:
-                # only try retrieve if store not empty
-                any_item = False
-                for _k, _v in store.items():
-                    any_item = True
-                    break
-
-                if any_item:
-                    ref_key, ref_item, sim = retrieve_best_reference(store, tgt_e, model.device)
-                    if (ref_item is not None) and (sim is not None) and (sim >= req.sim_threshold):
-                        past_kv_tuple, layer_scores = semshare_prefill(model, tok, req.prompt, ref_item)
-                        prunable_cache = build_prunable_cache(model, past_kv_tuple, layer_scores)
-                        out = model.generate(
-                            **inputs,
-                            past_key_values=prunable_cache,
-                            max_new_tokens=req.max_new_tokens,
-                            do_sample=req.temperature > 0,
-                            temperature=req.temperature,
-                            top_p=req.top_p,
-                        )
-                        used_semshare = True
-                        cache_hit = True
-                    else:
-                        out = model.generate(
-                            **inputs,
-                            max_new_tokens=req.max_new_tokens,
-                            do_sample=req.temperature > 0,
-                            temperature=req.temperature,
-                            top_p=req.top_p,
-                        )
+            if req.use_semshare and len(list(store.items())) > 0:
+                ref_key, ref_item, sim = retrieve_best_reference(store, tgt_e, model.device)
+                if (ref_item is not None) and (sim is not None) and (sim >= req.sim_threshold):
+                    past_kv_tuple, layer_scores = semshare_prefill(model, tok, req.prompt, ref_item)
+                    prunable_cache = build_prunable_cache(model, past_kv_tuple, layer_scores)
+                    out = model.generate(
+                        **inputs,
+                        past_key_values=prunable_cache,
+                        max_new_tokens=req.max_new_tokens,
+                        do_sample=req.temperature > 0,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                    )
+                    used_semshare = True
+                    cache_hit = True
                 else:
                     out = model.generate(
                         **inputs,
@@ -245,11 +237,14 @@ def create_app(model, tok, store: LRUCacheStore):
 
             text = tok.decode(out[0], skip_special_tokens=True)
 
-            # ---- store (online store, no persistence) ----
-            # stable key: md5(prompt)[:8]
-            key = req.store_key or ("p" + hashlib.md5(req.prompt.encode("utf-8")).hexdigest()[:8])
+            # store this prompt’s prefill cache for future reuse (online store, no persistence)
             item = prefill_and_make_item(model, tok, req.prompt)
+            key = req.store_key or ("p" + hashlib.md5(req.prompt.encode("utf-8")).hexdigest()[:8])
             store.put(key, item)
+
+            # ---- timing end ----
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            run_key = f"{'H' if cache_hit else 'M'}_{latency_ms:.0f}ms_{start_ms}_{key}"
 
             return {
                 "text": text,
@@ -258,6 +253,10 @@ def create_app(model, tok, store: LRUCacheStore):
                 "ref_key": ref_key,
                 "retrieved_sim": float(sim) if sim is not None else None,
                 "store_key": key,
+                # new fields:
+                "start_ms": start_ms,
+                "latency_ms": latency_ms,
+                "run_key": run_key,
             }
 
     return app
@@ -268,7 +267,7 @@ def main():
 
     os.environ["HF_HOME"] = args.hf_home
     os.environ.pop("TRANSFORMERS_CACHE", None)
-    if not args.online:
+    if args.offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
 
     tok = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True, local_files_only=True)
