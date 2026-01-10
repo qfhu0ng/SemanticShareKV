@@ -19,7 +19,6 @@ from semsharekv import (
     SemShareContext, set_semshare_context, disable_semshare,
     patch_llama_attention, patch_mistral_attention,
 )
-from semsharekv.store import pooled_cosine_01
 from semsharekv.lsh import lsh_token_match_and_sim
 
 

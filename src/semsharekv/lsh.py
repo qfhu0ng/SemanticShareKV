@@ -6,10 +6,10 @@ LSH_DIST_MIN = 0.0
 LSH_DIST_MAX = 30.0
 
 
-def _paper_sim_from_dist(dist: float) -> float:
-    """sim = clip(1 - (dist-min)/(max-min), 0, 1) with min=0 max=30."""
-    d_norm = (float(dist) - LSH_DIST_MIN) / (LSH_DIST_MAX - LSH_DIST_MIN)
-    return float(np.clip(1.0 - d_norm, 0.0, 1.0))
+# def _paper_sim_from_dist(dist: float) -> float:
+#     """sim = clip(1 - (dist-min)/(max-min), 0, 1) with min=0 max=30."""
+#     d_norm = (float(dist) - LSH_DIST_MIN) / (LSH_DIST_MAX - LSH_DIST_MIN)
+#     return float(np.clip(1.0 - d_norm, 0.0, 1.0))
 
 
 def lsh_token_match_and_sim(
@@ -43,6 +43,9 @@ def lsh_token_match_and_sim(
     D, I = index.search(tgt, 1)  # D: [Lt,1], I: [Lt,1]
     mapping = I.reshape(-1).astype(np.int64)
 
-    mean_dist = float(np.asarray(D).mean())
-    sim = _paper_sim_from_dist(mean_dist)
+    mean_hamming = float(np.asarray(D).mean())
+    # sim = clip(1 - mean_hamming/nbits, 0, 1)
+    sim = float(np.clip(1.0 - (mean_hamming / float(nbits)), 0.0, 1.0))
+    
+    
     return mapping, sim

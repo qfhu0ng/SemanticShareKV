@@ -19,7 +19,7 @@ from semsharekv import (
     SemShareContext, set_semshare_context, disable_semshare,
     patch_llama_attention, patch_mistral_attention,
 )
-from semsharekv.store import pooled_cosine_01
+from semsharekv.lsh import lsh_token_match_and_sim
 
 
 def is_mistral_like(name: str) -> bool:
@@ -55,11 +55,24 @@ def prefill_and_make_item(model, tok, prompt: str) -> CacheItem:
 
 @torch.no_grad()
 def retrieve_best_reference(store: LRUCacheStore, tgt_e: torch.Tensor, device: torch.device):
+    """
+    Choose best reference by LSH-distance similarity (paper-style), not pooled cosine.
+
+    sim := 1 - mean_hamming/nbits, where each target token is matched to nearest ref token in Hamming space.
+    """
+    import numpy as np
+
     best_key, best_item, best_sim = None, None, -1.0
+
+    # tgt_e: [Lt, D] torch -> np
+    tgt_np = tgt_e.detach().to("cpu").float().numpy()
+
     for k, item in store.items():
-        sim = pooled_cosine_01(tgt_e, item.e_cache.to(device))
+        ref_np = item.e_cache.detach().to("cpu").float().numpy()  # [Lr, D]
+        _, sim = lsh_token_match_and_sim(ref_np, tgt_np, nbits=256, seed=1234)
         if sim > best_sim:
             best_sim, best_key, best_item = sim, k, item
+
     return best_key, best_item, best_sim
 
 

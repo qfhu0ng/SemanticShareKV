@@ -11,8 +11,35 @@ try:
 except Exception as e:
     faiss = None
 
-from .store import pooled_cosine_01  # 你原来的精确 sim（0~1）
+# from .store import pooled_cosine_01  # 你原来的精确 sim（0~1）
 
+from dataclasses import dataclass
+from collections import OrderedDict
+import torch
+
+@dataclass
+class CacheItem:
+    prompt: str
+    e_cache: torch.Tensor   # [L, D] on CPU
+    past_kv: tuple          # tuple(layers)->(k,v), on CPU
+
+class LRUCacheStore:
+    def __init__(self, max_items: int = 8):
+        self.max_items = max_items
+        self._store = OrderedDict()
+
+    def put(self, key: str, item: CacheItem):
+        if key in self._store:
+            self._store.pop(key)
+        self._store[key] = item
+        while len(self._store) > self.max_items:
+            self._store.popitem(last=False)
+
+    def items(self):
+        return list(self._store.items())
+
+    def __len__(self):
+        return len(self._store)
 
 def _pool_vec(e_cache) -> np.ndarray:
     """
@@ -153,45 +180,3 @@ class LSHSemanticStore:
             idx = self._key2id[key]
             v = self._vecs[key].reshape(1, -1).astype(np.float32)
             self._index.add_with_ids(v, np.asarray([idx], dtype=np.int64))
-
-    def search_best(self, tgt_e_cache, device, exact_topn: int = 8):
-        """
-        返回：(ref_key, ref_item, sim, debug)
-        sim 用 pooled_cosine_01（0~1），hit 判断用 sim >= threshold（server 决定）
-        """
-        if len(self._od) == 0:
-            return None, None, None, None
-
-        q = _pool_vec(tgt_e_cache).reshape(1, -1).astype(np.float32)
-
-        # 1) LSH 召回 topk
-        k = min(self.topk, len(self._od))
-        D, I = self._index.search(q, k)
-        approx_ids = [int(x) for x in I[0] if int(x) != -1]
-        approx_dist = [float(x) for x in D[0][: len(approx_ids)]]
-
-        candidates: List[Tuple[str, object]] = []
-        for idx in approx_ids:
-            key = self._id2key.get(idx)
-            if key is None:
-                continue
-            item = self._od.get(key)
-            if item is None:
-                continue
-            candidates.append((key, item))
-
-        # fallback：极端情况召回为空就退化到扫描
-        if len(candidates) == 0:
-            candidates = list(self._od.items())
-
-        # 2) 精确重排：pooled_cosine_01 用的是 token-embedding 序列的 pooled cosine（你现有实现）
-        # 为了复用你现有的 pooled_cosine_01（它接收 [L,D]），这里直接对 e_cache 做精确算
-        best_key, best_item, best_sim = None, None, -1.0
-        for k0, it in candidates[:exact_topn]:
-            sim = pooled_cosine_01(tgt_e_cache, it.e_cache.to(device))
-            if sim > best_sim:
-                best_sim = float(sim)
-                best_key, best_item = k0, it
-
-        debug = LSHSearchDebug(approx_ids=approx_ids, approx_distances=approx_dist)
-        return best_key, best_item, best_sim, debug
